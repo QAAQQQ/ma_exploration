@@ -1,0 +1,1 @@
+# combine al the messages to each agent's observation
