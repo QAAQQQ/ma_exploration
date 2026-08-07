@@ -38,7 +38,7 @@ class MapGenerator:
             np.random.seed(seed)
 
 
-    def generate(self, map_type="maze"):
+    def generate(self, map_type="empty_arena"):
 
         if map_type == "random":
             grid = self.random_map()
@@ -48,6 +48,9 @@ class MapGenerator:
 
         elif map_type == "bsp":
             grid = self.bsp()
+        
+        elif map_type == "empty_arena":
+            grid = self.empty_arena()
 
         else:
             raise ValueError(
@@ -55,6 +58,23 @@ class MapGenerator:
             )
 
         return SemanticMap(grid)
+
+
+    def empty_arena(self):
+
+        grid = np.zeros(
+            (self.height,self.width),
+            dtype=np.int32
+        )
+
+        # Boundary walls
+        grid[0, :] = CellType.WALL
+        grid[-1, :] = CellType.WALL
+        grid[:, 0] = CellType.WALL
+        grid[:, -1] = CellType.WALL
+
+        return grid
+
 
 
     # -----------------------

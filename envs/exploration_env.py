@@ -1,23 +1,33 @@
-# 这个负责包装mujoco-> gym 
-# env.rest,env.step(actions)
+# MuJoCo -> multi-agent RL environment wrapper
 # obs, shared_obs, info = env.reset()
 # next_obs, next_shared_obs, rewards, dones, infos = env.step(actions)
 
 from __future__ import annotations
-
 from typing import Any
-from mujoco_lidar import MjLidarWrapper, scan_gen
-
 import mujoco
 import numpy as np
+from mujoco_lidar import MjLidarWrapper, scan_gen
 
 from scene.map_generator import MapGenerator
 from scene.map_to_scene import MapToScene
-from scene.robot_definition import RobotConfig
 from scene.mujoco_builder import MujocoBuilder
+from scene.robot_definition import RobotConfig
+from envs.communication_manager import CommunicationConfig, CommunicationManager
 from envs.coverage_tracker import CoverageTracker
+from envs.waypoint_controller import BaseController, FYController
+from sensors.lidar_processor import BaseLidarProcessor, Lidar2DProcessor
 
 class ExplorationEnv:
+    """
+    Multi-agent exploration environment.
+
+    High-level RL action per agent:
+        [dx_local, dy_local] in [-1, 1]^2
+
+    The action is mapped to a robot-local waypoint, transformed into world
+    coordinates, and executed through a replaceable waypoint controller.
+    """
+
     def __init__(
         self,
         n_agents: int = 2,
@@ -25,20 +35,35 @@ class ExplorationEnv:
         frame_skip: int = 1,
         lidar_cutoff: float = 5.0,
         render_mode: str | None = None,
+        waypoint_radius: float = 2.0,
+        max_control_steps_per_action: int = 50,
+        controller: BaseController | None = None,
     ) -> None:
-
-        self.n_agents = n_agents
-        self.max_episode_steps = max_episode_steps
-        self.frame_skip = frame_skip 
-        self.lidar_cutoff = lidar_cutoff
+        self.n_agents = int(n_agents)
+        self.max_episode_steps = int(max_episode_steps)
+        self.frame_skip = int(frame_skip)
+        self.lidar_cutoff = float(lidar_cutoff)
         self.render_mode = render_mode
+
+        # High-level action specification.
+        self.action_dim = 2
+        self.action_mode = "local_waypoint"
+        self.waypoint_radius = float(waypoint_radius)
+        self.max_control_steps_per_action = int(max_control_steps_per_action)
 
         self.generator = MapGenerator()
         self.converter = MapToScene()
         self.builder = MujocoBuilder()
 
-        # LiDAR 扫描模式暂时用 HDL64 (而且用的cpu，没有用到tachi或者mjx，后面要改动) TODO
+        # TODO: replace HDL64（CPU）maybe with LIVOX(MJX)
+        # 另外，这个返回的是flattern的（11016,）但真实ldiar数据不一定是这样flattern的
         self.theta, self.phi = scan_gen.generate_HDL64()
+        self.lidar_processor = Lidar2DProcessor(
+            min_z=-0.2,
+            max_z=0.2,
+            n_bins=360,
+            max_range=self.lidar_cutoff,
+        )
 
         self.semantic_map = None
         self.scene = None
@@ -46,18 +71,15 @@ class ExplorationEnv:
 
         self.model: mujoco.MjModel | None = None
         self.data: mujoco.MjData | None = None
-
         self.lidars: list[MjLidarWrapper] = []
 
-        self.current_step = 0
+        self.current_step = 0  # Number of high-level RL decisions.
+        self.physics_step_count = 0
 
-        self.world_bounds = (
-            0.0,
-            20.0,
-            0.0,
-            20.0,
-        )
+        self.robot_dof_addresses: list[dict[str, int]] = []
+        self.robot_body_ids: list[int] = []
 
+        self.world_bounds = (0.0, 20.0, 0.0, 20.0)
         self.coverage_resolution = 0.25
         self.exploration_radius = 0.4
 
@@ -67,68 +89,46 @@ class ExplorationEnv:
             exploration_radius=self.exploration_radius,
         )
 
-    def reset(self,seed: int | None = None,) -> tuple[np.ndarray, np.ndarray, dict[str, Any]]:
-        """
-        create new episode
-        Returns:
-            obs:每个 agent 的局部 observation
-            shared_obs:centralized critic 使用的全局 observation
-            info:环境附加信息，主要是传递训练用不到但是调试和评估有用的东西
-        """
+        self.communication_manager = CommunicationManager(
+            config=CommunicationConfig(enabled=False, message_dim=0),
+            n_agents=self.n_agents,
+        )
+
+        # Dependency injection point for future robot-specific controllers.
+        self.controller: BaseController = controller or FYController(
+            max_forward_speed=0.5,
+            max_yaw_rate=1.0,
+            waypoint_tolerance=0.15,
+            forward_gain=1.0,
+            yaw_gain=2.0,
+        )
+
+
+
+    def reset(
+        self,
+        seed: int | None = None,
+    ) -> tuple[np.ndarray, np.ndarray, dict[str, Any]]:
+        """Create a new episode."""
         self.current_step = 0
+        self.physics_step_count = 0
 
-        # 1. Generate map
-        self.semantic_map = self.generator.generate() 
-
-        # 2. Convert semantic map to scene
+        self.semantic_map = self.generator.generate()
         self.scene = self.converter.convert(self.semantic_map)
 
-        # 3. Sample robot spawn positions
         spawn_positions = self.converter.sample_spawn_position(
             self.semantic_map,
             n_agents=self.n_agents,
             seed=seed,
         )
 
-        # 4. Create robot definitions
         self.robot_list = self._create_robot_configs(spawn_positions)
-
-        # 5. Build MuJoCo model and data
-        self.model = self.builder.build(
-            self.scene,
-            self.robot_list,
-        )
+        self.model = self.builder.build(self.scene, self.robot_list)
         self.data = mujoco.MjData(self.model)
 
-        # 初始化 robot joint（但是可能是box only，后续再改）
-        self.robot_dof_addresses = []
-        for agent_id in range(self.n_agents):
-            robot_name = f"robot_{agent_id}"
-
-            x_joint_id = mujoco.mj_name2id(self.model,mujoco.mjtObj.mjOBJ_JOINT,f"{robot_name}_x_joint",)
-
-            y_joint_id = mujoco.mj_name2id(self.model,mujoco.mjtObj.mjOBJ_JOINT,f"{robot_name}_y_joint",)
-
-            yaw_joint_id = mujoco.mj_name2id(
-                self.model,
-                mujoco.mjtObj.mjOBJ_JOINT,
-                f"{robot_name}_yaw_joint",
-            )
-
-            if (x_joint_id == -1 or y_joint_id == -1 or yaw_joint_id == -1):
-                raise RuntimeError(f"Cannot find movement joints for {robot_name}")
-
-            self.robot_dof_addresses.append({
-                "x": int(self.model.jnt_dofadr[x_joint_id]),
-                "y": int(self.model.jnt_dofadr[y_joint_id]),
-                "yaw": int(self.model.jnt_dofadr[yaw_joint_id]),
-            })
-
-
-        # 确保派生状态被正确计算，例如 site_xpos
+        self._cache_robot_indices()
         mujoco.mj_forward(self.model, self.data)
 
-        # 6. Create one LiDAR wrapper per agent
         self.lidars = [
             MjLidarWrapper(
                 self.model,
@@ -139,44 +139,31 @@ class ExplorationEnv:
             for agent_id in range(self.n_agents)
         ]
 
-        # 7. Initial observations
+        self.coverage_tracker.reset()
+        initial_new_cells = self.coverage_tracker.update(
+            self._get_robot_positions()
+        )
+
+        self.communication_manager.reset()
+        self.controller.reset()
+
         obs = self._get_obs()
         shared_obs = self._get_shared_obs(obs)
 
-        # 8. Initialise coverage map
-        self.coverage_tracker.reset()
-        robot_positions = self._get_robot_positions()
-        initial_new_cells = self.coverage_tracker.update(robot_positions)
-
-        # 9. storage robot body id:
-        self.robot_body_ids = []
-        for agent_id in range(self.n_agents):
-            robot_name = f"robot_{agent_id}"
-
-            body_id = mujoco.mj_name2id(
-                self.model,
-                mujoco.mjtObj.mjOBJ_BODY,
-                robot_name,
-            )
-
-            if body_id == -1:
-                raise RuntimeError(
-                    f"Cannot find body {robot_name}"
-                )
-
-            self.robot_body_ids.append(body_id)
-
-
         info = {
             "step": self.current_step,
+            "physics_steps": self.physics_step_count,
             "spawn_positions": spawn_positions,
             "initial_explored_cells": initial_new_cells,
-            "coverage_ratio": (self.coverage_tracker.coverage_ratio),
+            "coverage_ratio": self.coverage_tracker.coverage_ratio,
+            "action_mode": self.action_mode,
         }
-
         return obs, shared_obs, info
 
-    def step(self,actions: np.ndarray) -> tuple[
+    def step(
+        self,
+        actions: np.ndarray,
+    ) -> tuple[
         np.ndarray,
         np.ndarray,
         np.ndarray,
@@ -184,71 +171,98 @@ class ExplorationEnv:
         list[dict[str, Any]],
     ]:
         """
-        执行一次环境 step。
+        Execute one high-level RL step.
 
         Args:
-            actions:
-                shape 通常为 (n_agents, action_dim)。
-
-        Returns:
-            obs:
-                shape (n_agents, obs_dim)
-            shared_obs:
-                shape (n_agents, shared_obs_dim)
-            rewards:
-                shape (n_agents, 1)
-            dones:
-                shape (n_agents,)
-            infos:
-                每个 agent 一个 info dict
+            actions: shape (n_agents, 2), each row is normalized
+                [dx_local, dy_local] in the robot frame.
         """
         self._check_ready()
+        actions = self._validate_actions(actions)
 
-        actions = np.asarray(actions, dtype=np.float32)
+        waypoints_world = self._actions_to_world_waypoints(actions)
+        reached = np.zeros(self.n_agents, dtype=bool)
+        last_commands = np.zeros((self.n_agents, 2), dtype=np.float64)
+        executed_control_steps = 0
+        total_newly_explored = 0
+        latest_coverage_status: dict[str, Any] = {}
 
-        if actions.shape[0] != self.n_agents:
-            raise ValueError(
-                f"Expected actions for {self.n_agents} agents, "
-                f"but received shape {actions.shape}."
+        # One high-level waypoint action is executed by several low-level steps.
+        for _ in range(self.max_control_steps_per_action):
+            positions = self._get_robot_positions()
+            yaws = self._get_robot_yaws()
+            commands = np.zeros((self.n_agents, 2), dtype=np.float64)
+
+            for agent_id in range(self.n_agents):
+                if reached[agent_id]:
+                    continue
+
+                command, agent_reached = self.controller.compute_command(
+                    robot_position=positions[agent_id],
+                    robot_yaw=float(yaws[agent_id]),
+                    waypoint_world=waypoints_world[agent_id],
+                )
+                commands[agent_id] = command
+                reached[agent_id] = agent_reached
+
+            last_commands = commands.copy()
+            if np.all(reached):
+                break
+
+            self._apply_low_level_commands(commands)
+            for _ in range(self.frame_skip):
+                mujoco.mj_step(self.model, self.data)
+                self.physics_step_count += 1
+
+            executed_control_steps += 1
+
+            # Stop an action early if the episode-level target is already met.
+            latest_coverage_status = self.coverage_tracker.update(
+                self._get_robot_positions()
             )
-
-        # 1. Apply agent actions
-        self._apply_actions(actions)
-
-        # 2. Advance MuJoCo physics
-        for _ in range(self.frame_skip):
-            mujoco.mj_step(self.model, self.data)
+            total_newly_explored += int(
+                latest_coverage_status.get("newly_explored", 0)
+            )
+            if self.coverage_tracker.coverage_ratio >= 0.9:
+                break
 
         self.current_step += 1
 
-        # 2.5： Get robot pos + calcuate coverage
-        robot_positions = self._get_robot_positions()
-        coverage_status = self.coverage_tracker.update(robot_positions)
-        coverage_ratio = (self.coverage_tracker.coverage_ratio)
+        # Ensure coverage is updated even when every waypoint was already reached.
+        if executed_control_steps == 0:
+            latest_coverage_status = self.coverage_tracker.update(
+                self._get_robot_positions()
+            )
+            total_newly_explored += int(
+                latest_coverage_status.get("newly_explored", 0)
+            )
 
-        # 3. Read new state
+        coverage_status = {
+            **latest_coverage_status,
+            "newly_explored": total_newly_explored,
+        }
+        coverage_ratio = self.coverage_tracker.coverage_ratio
+
         obs = self._get_obs()
         shared_obs = self._get_shared_obs(obs)
-
-        # 4. Compute reward
-        rewards = self._compute_rewards(newly_explored = coverage_status["newly_explored"])
-
-        # 5. Episode termination
-        time_over = self.current_step >= self.max_episode_steps
-        coverage_complete = coverage_ratio >= 0.9 
-        episode_done = (time_over or coverage_complete)
-
-        dones = np.full(
-            shape=(self.n_agents,),
-            fill_value=episode_done,
-            dtype=bool,
+        rewards = self._compute_rewards(
+            newly_explored=coverage_status["newly_explored"]
         )
 
+        time_over = self.current_step >= self.max_episode_steps
+        coverage_complete = coverage_ratio >= 0.9
+        episode_done = time_over or coverage_complete
+        dones = np.full(self.n_agents, episode_done, dtype=bool)
 
         infos = [
             {
                 "agent_id": agent_id,
                 "step": self.current_step,
+                "physics_steps": self.physics_step_count,
+                "waypoint_world": waypoints_world[agent_id].copy(),
+                "waypoint_reached": bool(reached[agent_id]),
+                "low_level_command": last_commands[agent_id].copy(),
+                "control_steps": executed_control_steps,
                 **coverage_status,
                 "time_limit_reached": time_over,
                 "coverage_complete": coverage_complete,
@@ -258,6 +272,130 @@ class ExplorationEnv:
 
         return obs, shared_obs, rewards, dones, infos
 
+    def _cache_robot_indices(self) -> None:
+        """Cache MuJoCo body IDs and velocity DoF addresses."""
+        self._check_ready()
+        self.robot_dof_addresses = []
+        self.robot_body_ids = []
+
+        for agent_id in range(self.n_agents):
+            robot_name = f"robot_{agent_id}"
+
+            joint_ids = {
+                "x": mujoco.mj_name2id(
+                    self.model,
+                    mujoco.mjtObj.mjOBJ_JOINT,
+                    f"{robot_name}_x_joint",
+                ),
+                "y": mujoco.mj_name2id(
+                    self.model,
+                    mujoco.mjtObj.mjOBJ_JOINT,
+                    f"{robot_name}_y_joint",
+                ),
+                "yaw": mujoco.mj_name2id(
+                    self.model,
+                    mujoco.mjtObj.mjOBJ_JOINT,
+                    f"{robot_name}_yaw_joint",
+                ),
+            }
+
+            if any(joint_id == -1 for joint_id in joint_ids.values()):
+                raise RuntimeError(f"Cannot find movement joints for {robot_name}")
+
+            self.robot_dof_addresses.append(
+                {
+                    key: int(self.model.jnt_dofadr[joint_id])
+                    for key, joint_id in joint_ids.items()
+                }
+            )
+
+            body_id = mujoco.mj_name2id(
+                self.model,
+                mujoco.mjtObj.mjOBJ_BODY,
+                robot_name,
+            )
+            if body_id == -1:
+                raise RuntimeError(f"Cannot find body {robot_name}")
+            self.robot_body_ids.append(int(body_id))
+
+    def _validate_actions(self, actions: np.ndarray) -> np.ndarray:
+        actions = np.asarray(actions, dtype=np.float32)
+        expected_shape = (self.n_agents, self.action_dim)
+        if actions.shape != expected_shape:
+            raise ValueError(
+                f"Expected actions shape {expected_shape}, got {actions.shape}."
+            )
+        if not np.all(np.isfinite(actions)):
+            raise ValueError("Actions contain NaN or infinity.")
+        return np.clip(actions, -1.0, 1.0)
+
+    def _actions_to_world_waypoints(self, actions: np.ndarray) -> np.ndarray:
+        """
+        Convert normalized robot-local [dx, dy] actions to world-frame goals.
+
+        Robot frame convention:
+            +x: forward
+            +y: left
+        """
+        positions = self._get_robot_positions()
+        yaws = self._get_robot_yaws()
+        waypoints = np.zeros((self.n_agents, 2), dtype=np.float64)
+
+        for agent_id in range(self.n_agents):
+            dx_local = float(actions[agent_id, 0] * self.waypoint_radius)
+            dy_local = float(actions[agent_id, 1] * self.waypoint_radius)
+            yaw = float(yaws[agent_id])
+
+            cos_yaw = float(np.cos(yaw))
+            sin_yaw = float(np.sin(yaw))
+            dx_world = cos_yaw * dx_local - sin_yaw * dy_local
+            dy_world = sin_yaw * dx_local + cos_yaw * dy_local
+
+            waypoints[agent_id] = [
+                positions[agent_id, 0] + dx_world,
+                positions[agent_id, 1] + dy_world,
+            ]
+
+        return waypoints
+
+    def _apply_low_level_commands(self, commands: np.ndarray) -> None:
+        """
+        Apply FYController outputs to the current kinematic box robots.
+
+        This is the robot-specific execution boundary. A future robot model can
+        replace this function or delegate it to a RobotInterface without changing
+        the policy action or waypoint controller interface.
+        """
+        expected_shape = (self.n_agents, 2)
+        commands = np.asarray(commands, dtype=np.float64)
+        if commands.shape != expected_shape:
+            raise ValueError(
+                f"Expected low-level commands shape {expected_shape}, "
+                f"got {commands.shape}."
+            )
+
+        for agent_id in range(self.n_agents):
+            dof = self.robot_dof_addresses[agent_id]
+            body_id = self.robot_body_ids[agent_id]
+            forward_speed = float(commands[agent_id, 0])
+            yaw_rate = float(commands[agent_id, 1])
+
+            rotation_matrix = self.data.xmat[body_id].reshape(3, 3)
+            forward_direction = rotation_matrix[:, 0]
+
+            self.data.qvel[dof["x"]] = forward_speed * forward_direction[0]
+            self.data.qvel[dof["y"]] = forward_speed * forward_direction[1]
+            self.data.qvel[dof["yaw"]] = yaw_rate
+
+    def _get_robot_yaws(self) -> np.ndarray:
+        """Read each robot's world-frame yaw from its body rotation matrix."""
+        self._check_ready()
+        yaws = []
+        for body_id in self.robot_body_ids:
+            rotation_matrix = self.data.xmat[body_id].reshape(3, 3)
+            yaws.append(np.arctan2(rotation_matrix[1, 0], rotation_matrix[0, 0]))
+        return np.asarray(yaws, dtype=np.float64)
+
     def _create_robot_configs(
         self,
         spawn_positions: list[tuple[float, float, float]],
@@ -266,185 +404,79 @@ class ExplorationEnv:
             (1.0, 0.0, 0.0, 1.0),
             (0.0, 0.0, 1.0, 1.0),
         ]
-
-        robot_configs = []
-
-        for agent_id in range(self.n_agents):
-            color = colors[agent_id % len(colors)]
-
-            robot_configs.append(
-                RobotConfig(
-                    name=f"robot_{agent_id}",
-                    position=spawn_positions[agent_id],
-                    color=color,
-                    model_type="box",
-                    size=(0.2, 0.2, 0.2),
-                )
+        return [
+            RobotConfig(
+                name=f"robot_{agent_id}",
+                position=spawn_positions[agent_id],
+                color=colors[agent_id % len(colors)],
+                model_type="box",
+                size=(0.2, 0.2, 0.2),
             )
+            for agent_id in range(self.n_agents)
+        ]
 
-        return robot_configs
-
-    def _get_obs(self) -> np.ndarray:
+    def _get_lidar_obs(self) -> np.ndarray:
         """
-        暂时直接返回 LiDAR ranges。
-        后面会把它改成固定数量的二维射线，并加入速度、方向等状态。TODO
+        Return LiDAR point clouds for all agents.
+
+        Returns:
+            point_clouds:
+                shape (n_agents, n_points, 3)
+                每个点为 LiDAR local frame 下的 [x, y, z]。
         """
         self._check_ready()
+        point_clouds = []
 
-        observations = []
-
-        for agent_id in range(self.n_agents):
-            ranges = self.lidars[agent_id].trace_rays(
+        for lidar in self.lidars:
+            # Update current scan
+            lidar.trace_rays(
                 self.data,
                 self.theta,
                 self.phi,
             )
-
-            ranges = np.asarray(ranges, dtype=np.float32)
-
-            # 将无穷值和异常值限制在 cutoff_dist
-            ranges = np.nan_to_num(
-                ranges,
-                nan=self.lidar_cutoff,
-                posinf=self.lidar_cutoff,
-                neginf=0.0,
+            
+            points = lidar.get_hit_points()
+            points = np.asarray(
+                points,
+                dtype=np.float32,
             )
 
-            ranges = np.clip(
-                ranges,
-                0.0,
-                self.lidar_cutoff,
-            )
+            point_clouds.append(self.lidar_processor.process(points))
+        return np.stack(point_clouds, axis=0)
 
-            # 归一化到 [0, 1]
-            ranges = ranges / self.lidar_cutoff
 
-            observations.append(ranges)
-
-        return np.stack(observations, axis=0)
-
-    def _get_shared_obs(self,obs: np.ndarray)-> np.ndarray:
+    def _get_obs(self) -> np.ndarray:
         """
-        第一版 centralized observation：把所有 agent 的局部 observation 拼起来。
-        每个 agent 都得到同一份 shared observation。
+        Return raw LiDAR point clouds as agent observations.
+        Returns:
+            obs:
+                shape (n_agents, n_points, 3)
         """
+        return self._get_lidar_obs() 
+
+
+    def _get_shared_obs(self, obs: np.ndarray) -> np.ndarray:
+        """Give every agent the same concatenated centralized observation."""
         global_obs = obs.reshape(-1)
-
-        shared_obs = np.repeat(
-            global_obs[None, :],
-            repeats=self.n_agents,
-            axis=0,
+        return np.repeat(global_obs[None, :], self.n_agents, axis=0).astype(
+            np.float32
         )
 
-        return shared_obs.astype(np.float32)
-
-    def _apply_actions(self, actions: np.ndarray)-> None:
-        """
-        必须根据机器人使用的 joint 类型决定：
-        - freejoint
-        - slide joint
-        - mocap
-        - actuator
-        - 直接修改 qvel
-        我要更改他，从最开始的变成2维，我之前没有自己细致写到过这个程度
-        """  
-        # raise NotImplementedError("Action application has not been implemented yet.")
-        expected_shape = (self.n_agents, 2)
-
-        if actions.shape != expected_shape:
-            raise ValueError(
-                f"Expected actions shape {expected_shape}, "
-                f"but received {actions.shape}"
-            )
-
-        actions = np.clip(actions, -1.0, 1.0)
-
-        max_forward_velocity = 1.5
-        max_yaw_rate = 1.0
-
-        for agent_id in range(self.n_agents):
-            dof = self.robot_dof_addresses[agent_id]
-            body_id = self.robot_body_ids[agent_id]
-
-            forward_velocity = (
-                actions[agent_id, 0]
-                * max_forward_velocity
-            )
-
-            yaw_rate = (
-                actions[agent_id, 1]
-                * max_yaw_rate
-            )
-
-            # MuJoCo 保存的是 body 从局部坐标到世界坐标的旋转矩阵
-            rotation_matrix = self.data.xmat[
-                body_id
-            ].reshape(3, 3)
-
-            # 假设机器人局部 +x 轴是前方。
-            # 取局部 x 轴在世界坐标中的方向。
-            forward_direction = rotation_matrix[:, 0]
-
-            vx = forward_velocity * forward_direction[0]
-            vy = forward_velocity * forward_direction[1]
-
-            self.data.qvel[dof["x"]] = vx
-            self.data.qvel[dof["y"]] = vy
-            self.data.qvel[dof["yaw"]] = yaw_rate
-
-    def _compute_rewards(self,newly_explored: int)->np.ndarray:
-        """
-        临时 reward。
-        环境框架测试期间先返回 0。
-        后面再加入 exploration coverage、collision、step penalty。
-        """
-        # 测试期间返回0
-        # return np.zeros(
-        #     shape=(self.n_agents, 1),
-        #     dtype=np.float32,
-        # )
+    def _compute_rewards(self, newly_explored: int) -> np.ndarray:
         coverage_reward = float(newly_explored)
         step_penalty = 0.01
-
-        team_reward = (
-            coverage_reward
-            - step_penalty
-        )
-
-        return np.full(
-            (self.n_agents, 1),
-            team_reward,
-            dtype=np.float32,
-        )
+        team_reward = coverage_reward - step_penalty
+        return np.full((self.n_agents, 1), team_reward, dtype=np.float32)
 
     def _get_robot_positions(self) -> np.ndarray:
         self._check_ready()
-
-        positions = []
-
-        for agent_id in range(self.n_agents):
-            body_id = mujoco.mj_name2id(
-                self.model,
-                mujoco.mjtObj.mjOBJ_BODY,
-                f"robot_{agent_id}",
-            )
-
-            if body_id == -1:
-                raise RuntimeError(
-                    f"Cannot find body robot_{agent_id}"
-                )
-
-            positions.append(
-                self.data.xpos[body_id].copy()
-            )
-
+        if not self.robot_body_ids:
+            raise RuntimeError("Robot body IDs have not been initialized.")
         return np.asarray(
-            positions,
+            [self.data.xpos[body_id].copy() for body_id in self.robot_body_ids],
             dtype=np.float32,
         )
 
     def _check_ready(self) -> None:
         if self.model is None or self.data is None:
-            raise RuntimeError(
-                "Environment is not initialized. Call reset() first."
-            )
+            raise RuntimeError("Environment is not initialized. Call reset() first.")

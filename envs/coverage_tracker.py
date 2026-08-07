@@ -1,6 +1,21 @@
 from __future__ import annotations
 import numpy as np
 
+# ==========================================================
+# TODO (Environment v0.2)
+#
+# Current implementation:
+#   - Position-based circular coverage.
+#
+# Future potential improvements:
+#   1. Replace position coverage with LiDAR visibility.
+#   2. Traversable/valid coverage mask. （Mainly skip this one now)
+#   3. Support arbitrary MuJoCo scenes instead of SemanticMap only.
+#   4. Support real-world occupancy maps / SLAM maps.
+#   5. Add overlap statistics and per-agent contribution.
+#
+# ==========================================================
+
 
 class CoverageTracker:
     """
@@ -64,8 +79,10 @@ class CoverageTracker:
         self.explored_map.fill(False)
 
         if traversable_mask is None:
-            self.traversable_mask.fill(True)
-            return
+            # 每次reset的时候，如果这个mask没有的话，原来的可通行区域湖北覆盖成整个场景都可探索？
+            # mask是一张记录 哪些格子有资格被计入探索的地图
+            self.traversable_mask.fill(True) 
+            return 
 
         traversable_mask = np.asarray(
             traversable_mask,

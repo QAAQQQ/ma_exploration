@@ -42,6 +42,10 @@ def main() -> None:
 
     print("========== RESET ==========")
     print("obs shape:", obs.shape)
+    print("single lidar shape:", obs[0].shape)
+    print("single lidar size:", obs[0].size)
+    print("min:", obs[0].min())
+    print("max:", obs[0].max())
     print("shared obs shape:", shared_obs.shape)
     print("spawn positions:", info["spawn_positions"])
 
@@ -70,8 +74,8 @@ def main() -> None:
 
         actions = np.array(
         [
-            [0.8, 0.5],    # robot_0 前进并向左转
-            [0.8, -0.5],   # robot_1 前进并向右转
+            [1.0, 0],    # robot_0 前进并向左转
+            [0.0, 1],   # robot_1 前进并向右转
         ],
         dtype=np.float32,
     )

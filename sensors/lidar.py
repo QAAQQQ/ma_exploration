@@ -1,1 +1,0 @@
-# get Lidar data from mujoco state
