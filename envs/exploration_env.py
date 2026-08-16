@@ -16,6 +16,7 @@ from envs.communication_manager import CommunicationConfig, CommunicationManager
 from envs.coverage_tracker import CoverageTracker
 from envs.waypoint_controller import BaseController, FYController
 from sensors.lidar_processor import BaseLidarProcessor, Lidar2DProcessor
+from agent.agent_knowledge import AgentKnowledge
 
 class ExplorationEnv:
     """
@@ -103,13 +104,17 @@ class ExplorationEnv:
             yaw_gain=2.0,
         )
 
+        self.agent_knowledge = [
+        AgentKnowledge(
+            world_bounds=self.world_bounds,
+            map_resolution=self.coverage_resolution,
+            visit_radius=self.exploration_radius,
+            patch_size_m=5.0,
+        )for _ in range(self.n_agents)
+]
 
 
-    def reset(
-        self,
-        seed: int | None = None,
-    ) -> tuple[np.ndarray, np.ndarray, dict[str, Any]]:
-        """Create a new episode."""
+    def reset(self,seed: int | None = None)-> tuple[np.ndarray, np.ndarray, dict[str, Any]]:
         self.current_step = 0
         self.physics_step_count = 0
 
@@ -144,6 +149,14 @@ class ExplorationEnv:
             self._get_robot_positions()
         )
 
+        positions = self._get_robot_positions()
+
+        for agent_id in range(self.n_agents):
+            self.agent_knowledge[agent_id].reset()
+            self.agent_knowledge[agent_id].update(
+                positions[agent_id]
+            )
+
         self.communication_manager.reset()
         self.controller.reset()
 
@@ -176,6 +189,7 @@ class ExplorationEnv:
         Args:
             actions: shape (n_agents, 2), each row is normalized
                 [dx_local, dy_local] in the robot frame.
+        
         """
         self._check_ready()
         actions = self._validate_actions(actions)
@@ -447,12 +461,46 @@ class ExplorationEnv:
 
     def _get_obs(self) -> np.ndarray:
         """
-        Return raw LiDAR point clouds as agent observations.
-        Returns:
-            obs:
-                shape (n_agents, n_points, 3)
+        Build policy observation for each agent.
+
+        Current observation:
+            LiDAR scan
+            +
+            agent-local visited memory
         """
-        return self._get_lidar_obs() 
+        lidar_obs = self._get_lidar_obs()
+        positions = self._get_robot_positions()
+
+        observations = []
+
+        for agent_id in range(self.n_agents):
+
+            # Update this agent's own knowledge
+            self.agent_knowledge[agent_id].update(
+                positions[agent_id]
+            )
+
+            knowledge_obs = (
+                self.agent_knowledge[
+                    agent_id
+                ].get_observation(
+                    positions[agent_id]
+                )
+            )
+
+            obs = np.concatenate(
+                [
+                    lidar_obs[agent_id],
+                    knowledge_obs,
+                ]
+            ).astype(np.float32)
+
+            observations.append(obs)
+
+        return np.stack(
+            observations,
+            axis=0,
+        ) 
 
 
     def _get_shared_obs(self, obs: np.ndarray) -> np.ndarray:

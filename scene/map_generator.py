@@ -38,7 +38,7 @@ class MapGenerator:
             np.random.seed(seed)
 
 
-    def generate(self, map_type="empty_arena"):
+    def generate(self, map_type="maze"):
 
         if map_type == "random":
             grid = self.random_map()

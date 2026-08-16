@@ -17,6 +17,9 @@ class MujocoBuilder:
     # ==================================================
 
     def build(self, scene, robots):
+        # 每次 build 都从干净的 MuJoCo scene 开始
+        self.spec = mujoco.MjSpec()
+        self.world = self.spec.worldbody
 
         # floor
         for floor in scene.floors:

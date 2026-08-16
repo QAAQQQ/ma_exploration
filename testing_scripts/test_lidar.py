@@ -3,8 +3,6 @@ import numpy as np
 
 from envs.exploration_env import ExplorationEnv
 
-
-
 def main():
     env = ExplorationEnv(
         n_agents=2,
