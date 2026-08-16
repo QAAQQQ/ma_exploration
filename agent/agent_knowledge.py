@@ -3,6 +3,7 @@
 from __future__ import annotations
 import numpy as np
 from .local_map import LocalMap
+from .occupancy_map import OccupancyMap
 
 class AgentKnowledge:
     """
@@ -34,6 +35,10 @@ class AgentKnowledge:
             visit_radius=visit_radius,
             patch_size_m=patch_size_m,
         )
+        self.occupancy_map = OccupancyMap(
+            world_bounds=world_bounds,
+            resolution=map_resolution,
+        )
 
     @property
     def observation_dim(self) -> int:
@@ -47,6 +52,20 @@ class AgentKnowledge:
         Reset all agent-side knowledge.
         """
         self.local_map.reset()
+        self.occupancy_map.reset()
+
+    def update_occupancy(
+        self,
+        hit_points_local: np.ndarray,
+        robot_position: np.ndarray,
+        robot_yaw: float,
+    ) -> dict[str, int]:
+        """Update the diagnostic occupancy map without changing policy input."""
+        return self.occupancy_map.update(
+            hit_points_local=hit_points_local,
+            robot_position=robot_position,
+            robot_yaw=robot_yaw,
+        )
 
     def update(
         self,

@@ -36,6 +36,7 @@ def save_agent_maps(
     Saves:
         agent_X_visited_map.png
         agent_X_local_patch.png
+        agent_X_occupancy_frontiers.png
     """
     os.makedirs(
         save_dir,
@@ -90,7 +91,58 @@ def save_agent_maps(
         plt.close()
 
         # -------------------------------------------------
-        # 2. Final robot-centred local patch
+        # 2. LiDAR occupancy map and frontier candidates
+        # -------------------------------------------------
+        snapshot = env.get_mapping_snapshot(agent_id)
+        occupancy = knowledge.occupancy_map
+        display_grid = snapshot["occupancy_grid"].astype(np.float32)
+        # Display convention: unknown=0.5 grey, free=1 white, occupied=0 black.
+        display_grid = np.where(display_grid < 0, 0.5, 1.0 - display_grid)
+
+        plt.figure(figsize=(7, 6))
+        plt.imshow(
+            display_grid,
+            origin="lower",
+            cmap="gray",
+            vmin=0.0,
+            vmax=1.0,
+            extent=(occupancy.xmin, occupancy.xmax, occupancy.ymin, occupancy.ymax),
+        )
+
+        frontier_rows, frontier_cols = np.nonzero(snapshot["frontier_mask"])
+        if len(frontier_rows):
+            frontier_xy = np.asarray(
+                [occupancy.grid_to_world(row, col)
+                 for row, col in zip(frontier_rows, frontier_cols)]
+            )
+            plt.scatter(
+                frontier_xy[:, 0], frontier_xy[:, 1],
+                s=5, c="deepskyblue", label="frontier cells",
+            )
+
+        candidates = snapshot["frontier_candidates"]
+        if len(candidates):
+            plt.scatter(
+                candidates[:, 0], candidates[:, 1],
+                s=70, c="red", marker="x", label="candidates",
+            )
+        plt.scatter(
+            positions[agent_id, 0], positions[agent_id, 1],
+            s=60, c="lime", marker="o", edgecolors="black", label="robot",
+        )
+        plt.title(f"Agent {agent_id} - Occupancy and Frontiers")
+        plt.xlabel("World X (m)")
+        plt.ylabel("World Y (m)")
+        plt.legend(loc="upper right")
+        plt.tight_layout()
+        plt.savefig(
+            os.path.join(save_dir, f"agent_{agent_id}_occupancy_frontiers.png"),
+            dpi=150,
+        )
+        plt.close()
+
+        # -------------------------------------------------
+        # 3. Final robot-centred local patch
         # -------------------------------------------------
         patch = (
             knowledge.get_local_patch(

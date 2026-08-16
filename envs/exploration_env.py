@@ -440,8 +440,10 @@ class ExplorationEnv:
         """
         self._check_ready()
         point_clouds = []
+        positions = self._get_robot_positions()
+        yaws = self._get_robot_yaws()
 
-        for lidar in self.lidars:
+        for agent_id, lidar in enumerate(self.lidars):
             # Update current scan
             lidar.trace_rays(
                 self.data,
@@ -455,8 +457,27 @@ class ExplorationEnv:
                 dtype=np.float32,
             )
 
+            # Mapping is a side channel only: the existing processed LiDAR
+            # observation returned below remains byte-for-byte the same shape.
+            self.agent_knowledge[agent_id].update_occupancy(
+                hit_points_local=points,
+                robot_position=positions[agent_id],
+                robot_yaw=float(yaws[agent_id]),
+            )
+
             point_clouds.append(self.lidar_processor.process(points))
         return np.stack(point_clouds, axis=0)
+
+    def get_mapping_snapshot(self, agent_id: int) -> dict[str, np.ndarray]:
+        """Return copies of map products for inspection/visualisation."""
+        if not 0 <= agent_id < self.n_agents:
+            raise IndexError(f"agent_id must be in [0, {self.n_agents}), got {agent_id}")
+        occupancy = self.agent_knowledge[agent_id].occupancy_map
+        return {
+            "occupancy_grid": occupancy.grid.copy(),
+            "frontier_mask": occupancy.frontier_mask.copy(),
+            "frontier_candidates": occupancy.frontier_candidates.copy(),
+        }
 
 
     def _get_obs(self) -> np.ndarray:
