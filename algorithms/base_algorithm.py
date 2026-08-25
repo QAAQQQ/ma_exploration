@@ -8,6 +8,7 @@ class BaseAlgorithm(ABC):
         obs,
         shared_obs=None,
         training: bool = True,
+        action_masks=None,
     ):
         """
         Return actions for all agents.

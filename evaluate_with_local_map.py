@@ -33,10 +33,7 @@ def save_agent_maps(
     """
     Save each agent's final knowledge map after evaluation.
 
-    Saves:
-        agent_X_visited_map.png
-        agent_X_local_patch.png
-        agent_X_occupancy_frontiers.png
+    Saves the unified map, its clustered frontiers, and the final local patch.
     """
     os.makedirs(
         save_dir,
@@ -53,10 +50,10 @@ def save_agent_maps(
         ]
 
         # -------------------------------------------------
-        # 1. Full visited-memory map
+        # 1. Full unified occupancy map
         # -------------------------------------------------
         full_map = (
-            knowledge.local_map.grid
+            knowledge.map.grid
             .copy()
         )
 
@@ -67,12 +64,12 @@ def save_agent_maps(
         plt.imshow(
             full_map,
             origin="lower",
-            vmin=0.0,
+            vmin=-1.0,
             vmax=1.0,
         )
 
         plt.title(
-            f"Agent {agent_id} - Visited Map"
+            f"Agent {agent_id} - Agent Map"
         )
 
         plt.xlabel("Grid X")
@@ -83,7 +80,7 @@ def save_agent_maps(
         plt.savefig(
             os.path.join(
                 save_dir,
-                f"agent_{agent_id}_visited_map.png",
+                f"agent_{agent_id}_map.png",
             ),
             dpi=150,
         )
@@ -94,7 +91,7 @@ def save_agent_maps(
         # 2. LiDAR occupancy map and frontier candidates
         # -------------------------------------------------
         snapshot = env.get_mapping_snapshot(agent_id)
-        occupancy = knowledge.occupancy_map
+        occupancy = knowledge.map
         display_grid = snapshot["occupancy_grid"].astype(np.float32)
         # Display convention: unknown=0.5 grey, free=1 white, occupied=0 black.
         display_grid = np.where(display_grid < 0, 0.5, 1.0 - display_grid)
@@ -162,7 +159,7 @@ def save_agent_maps(
         )
 
         centre = (
-            knowledge.local_map
+            knowledge.map
             .patch_radius_cells
         )
 
@@ -264,6 +261,7 @@ def evaluate(
                 obs=obs,
                 shared_obs=shared_obs,
                 training=False,
+                action_masks=env.get_action_masks(),
             )
 
             (

@@ -1,1 +1,1 @@
-# combine al the messages to each agent's observation
+# combine all the sensor messages to each agent's observation

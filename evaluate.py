@@ -53,7 +53,7 @@ def evaluate(
         shared_obs.shape[1]
     )
 
-    action_dim = 2
+    action_dim = env.action_dim
 
     agents = [
         f"agent_{i}"
@@ -112,24 +112,12 @@ def evaluate(
             if not viewer.is_running():
                 break
 
-            actions = np.zeros(
-                (
-                    env.n_agents,
-                    action_dim,
-                ),
-                dtype=np.float32,
+            actions = mappo.act(
+                obs=obs,
+                shared_obs=shared_obs,
+                training=False,
+                action_masks=env.get_action_masks(),
             )
-
-            for (
-                agent_id,
-                agent,
-            ) in enumerate(agents):
-                actions[
-                    agent_id
-                ] = mappo.predict(
-                    agent,
-                    obs[agent_id],
-                )
 
             (
                 obs,
